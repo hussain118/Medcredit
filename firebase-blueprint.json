@@ -1,0 +1,107 @@
+{
+  "entities": {
+    "UserSetting": {
+      "title": "User Settings",
+      "description": "App settings for the pharmacy/user",
+      "type": "object",
+      "properties": {
+        "pharmacyName": {
+          "type": "string",
+          "description": "The name of the pharmacy"
+        },
+        "reminderTime": {
+          "type": "string",
+          "description": "Daily reminder time (HH:MM)"
+        },
+        "language": {
+          "type": "string",
+          "enum": ["en", "ur"],
+          "description": "User prefered UI language"
+        },
+        "googleSheetsId": {
+          "type": "string",
+          "description": "Identifier for Google Sheet"
+        },
+        "googleSheetsAutoSync": {
+          "type": "boolean",
+          "description": "Toggle to sync changes automatically"
+        },
+        "googleSheetsUrl": {
+          "type": "string",
+          "description": "Public view URL of Google Sheet"
+        }
+      },
+      "required": ["pharmacyName", "language"]
+    },
+    "PharmacyRecord": {
+      "title": "Pharmacy Record",
+      "description": "Credit record for a customer or a supplier, optionally containing itemized medicine rows",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Random unique ID representing the record"
+        },
+        "description": {
+          "type": "string",
+          "description": "General notes or text list of medicines"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Numeric sum of the debt/credit"
+        },
+        "date": {
+          "type": "string",
+          "format": "date",
+          "description": "ISO date of purchase/transaction"
+        },
+        "dueDate": {
+          "type": "string",
+          "format": "date",
+          "description": "ISO date of expected payment"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "due-today", "overdue", "paid"],
+          "description": "Current resolution status of the ledger"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["customer", "supplier"],
+          "description": "Indicates if the credit partner is customer or supplier"
+        },
+        "quantity": {
+          "type": "string",
+          "description": "Optional customer record medicine details"
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Name of the customer"
+        },
+        "phoneNumber": {
+          "type": "string",
+          "description": "Main WhatsApp contact number for the customer"
+        },
+        "supplierName": {
+          "type": "string",
+          "description": "Name of the supplier if record type is supplier"
+        },
+        "items": {
+          "type": "array",
+          "description": "Itemized fields of medicine details"
+        }
+      },
+      "required": ["id", "amount", "date", "dueDate", "status", "type"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/settings/app": {
+      "schema": "UserSetting",
+      "description": "User specific application settings"
+    },
+    "/users/{userId}/records/{recordId}": {
+      "schema": "PharmacyRecord",
+      "description": "User specific ledger records list"
+    }
+  }
+}

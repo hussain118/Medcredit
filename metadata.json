@@ -1,0 +1,6 @@
+{
+  "name": "AsquafMedical",
+  "description": "A premium dark-themed WhatsApp-styled credit and payment tracker for pharmacies, supporting Urdu and English.",
+  "requestFramePermissions": ["notifications"],
+  "majorCapabilities": []
+}

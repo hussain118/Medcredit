@@ -1,0 +1,17 @@
+{
+  "name": "AsquafMedical",
+  "short_name": "AsquafMed",
+  "description": "Pharmacy Credit & Payment Tracker",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b141a",
+  "theme_color": "#202c33",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3022/3022248.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
