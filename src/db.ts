@@ -14,7 +14,8 @@ import { AppRecord, AppSettings } from './types';
 
 // Obtain initialized Firebase app or initialize it safely
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-export const db = getFirestore(app);
+const databaseId = firebaseConfig.firestoreDatabaseId || '(default)';
+export const db = getFirestore(app, databaseId);
 
 export enum OperationType {
   CREATE = 'create',
