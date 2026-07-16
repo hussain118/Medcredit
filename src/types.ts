@@ -25,6 +25,16 @@ export interface MedicineItem {
   price: number;
 }
 
+export interface Payment {
+  id: string;
+  amount: number;
+  date: string;
+  method?: string; // 'Cash' | 'Easypaisa' | 'JazzCash' | 'Bank' | 'Cheque'
+  note?: string;
+  reversesPaymentId?: string;
+  createdAt: string;
+}
+
 export interface BaseRecord {
   id: string;
   description: string;
@@ -48,6 +58,8 @@ export interface CustomerRecord extends BaseRecord {
 export interface SupplierRecord extends BaseRecord {
   type: 'supplier';
   supplierName: string;
+  phoneNumber?: string;
+  payments?: Payment[];
 }
 
 export type AppRecord = CustomerRecord | SupplierRecord;

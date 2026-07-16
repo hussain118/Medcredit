@@ -47,13 +47,15 @@ import {
   deleteRecordFromFirebase 
 } from './db';
 import { createSpreadsheet, syncToSpreadsheet } from './googleSheets';
+import { handleSchemaMigration, migrateRecords } from './lib/migration';
+import { getSupplierDueCalculations } from './lib/supplierDues';
 
 export default function App() {
   // State
   const [activeTab, setActiveTab] = useState<'customers' | 'suppliers' | 'settings'>('customers');
   const [records, setRecords] = useState<AppRecord[]>(() => {
     const saved = localStorage.getItem('pharmacy_records');
-    return saved ? JSON.parse(saved) : [];
+    return handleSchemaMigration(saved);
   });
   const [settings, setSettings] = useState<AppSettings>(() => {
     const saved = localStorage.getItem('pharmacy_settings');
@@ -68,6 +70,7 @@ export default function App() {
     };
   });
   const [isAdding, setIsAdding] = useState(false);
+  const [paymentRecord, setPaymentRecord] = useState<SupplierRecord | null>(null);
   const [notifiedRecords, setNotifiedRecords] = useState<string[]>([]);
   
   // Google Sheets integration state
@@ -125,8 +128,9 @@ export default function App() {
           // 2. Fetch ledger records
           const dbRecords = await loadRecordsFromFirebase(user.uid);
           if (dbRecords && dbRecords.length > 0) {
-            setRecords(dbRecords);
-            localStorage.setItem('pharmacy_records', JSON.stringify(dbRecords));
+            const migrated = migrateRecords(dbRecords);
+            setRecords(migrated);
+            localStorage.setItem('pharmacy_records', JSON.stringify(migrated));
           } else if (records.length > 0) {
             // Cloud is empty but has local cache records: push them to cloud
             for (const r of records) {
@@ -201,14 +205,43 @@ export default function App() {
     const checkDueDates = () => {
       const today = new Date();
       records.forEach(record => {
-        if (record.status === 'paid') return;
-        
-        const dueDate = parseISO(record.dueDate);
         const alreadyNotified = notifiedRecords.includes(record.id);
+        let isDueTime = false;
+        let notificationBody = '';
+        let isSettled = false;
 
-        if (isToday(dueDate) && !alreadyNotified) {
+        if (record.type === 'supplier') {
+          const calcs = getSupplierDueCalculations(record as SupplierRecord, today);
+          isSettled = calcs.status === 'settled';
+          if (!isSettled) {
+            const dueDate = parseISO(record.dueDate);
+            const oneDayBefore = addDays(dueDate, -1);
+            if (isToday(dueDate)) {
+              isDueTime = true;
+              notificationBody = isUrdu 
+                ? `⚠️ ${record.supplierName} — Rs. ${calcs.remaining.toLocaleString()} باقی، آج واجب الادا ہے۔`
+                : `⚠️ ${record.supplierName} — Rs. ${calcs.remaining.toLocaleString()} baqi, due today.`;
+            } else if (isToday(oneDayBefore)) {
+              isDueTime = true;
+              notificationBody = isUrdu 
+                ? `⚠️ ${record.supplierName} — Rs. ${calcs.remaining.toLocaleString()} باقی، کل واجب الادا ہے۔`
+                : `⚠️ ${record.supplierName} — Rs. ${calcs.remaining.toLocaleString()} baqi, due tomorrow.`;
+            }
+          }
+        } else {
+          isSettled = record.status === 'paid';
+          if (!isSettled) {
+            const dueDate = parseISO(record.dueDate);
+            if (isToday(dueDate)) {
+              isDueTime = true;
+              notificationBody = `${isUrdu ? 'آج واجب الادا' : 'Due today'}: ${(record as CustomerRecord).customerName} - Rs. ${record.amount.toLocaleString()}`;
+            }
+          }
+        }
+
+        if (isDueTime && !isSettled && !alreadyNotified) {
           new Notification(settings.pharmacyName, {
-            body: `${isUrdu ? 'آج واجب الادا' : 'Due today'}: ${record.type === 'customer' ? (record as CustomerRecord).customerName : (record as SupplierRecord).supplierName} - Rs. ${record.amount}`,
+            body: notificationBody,
             icon: '/favicon.ico'
           });
           setNotifiedRecords(prev => [...prev, record.id]);
@@ -229,7 +262,12 @@ export default function App() {
     if (isToday(dueDate)) status = 'due-today';
     else if (isPast(dueDate)) status = 'overdue';
 
-    const fullRecord = { ...newRecord, id, status } as AppRecord;
+    const fullRecord = { 
+      ...newRecord, 
+      id, 
+      status,
+      ...(newRecord.type === 'supplier' ? { payments: [] } : {})
+    } as AppRecord;
 
     setRecords(prev => [fullRecord, ...prev]);
     setIsAdding(false);
@@ -250,6 +288,84 @@ export default function App() {
       if (target && user) {
         saveRecordToFirebase(user.uid, target).catch(err => {
           console.error("Failed to update status on Firestore:", err);
+        });
+      }
+      return updated;
+    });
+  };
+
+  const recordPayment = (recordId: string, payment: { amount: number; date: string; method: string; note?: string }) => {
+    setRecords(prev => {
+      const updated = prev.map(r => {
+        if (r.id === recordId && r.type === 'supplier') {
+          const supplier = r as SupplierRecord;
+          const newPayment = {
+            ...payment,
+            id: 'pay_' + Math.random().toString(36).substr(2, 9),
+            createdAt: new Date().toISOString()
+          };
+          const currentPayments = supplier.payments || [];
+          const updatedPayments = [...currentPayments, newPayment];
+          
+          const tempSupplier = { ...supplier, payments: updatedPayments };
+          const calcs = getSupplierDueCalculations(tempSupplier, new Date());
+          
+          return {
+            ...supplier,
+            payments: updatedPayments,
+            status: calcs.status === 'settled' ? 'paid' : 'pending'
+          } as AppRecord;
+        }
+        return r;
+      });
+
+      const target = updated.find(r => r.id === recordId);
+      if (target && user) {
+        saveRecordToFirebase(user.uid, target).catch(err => {
+          console.error("Failed to save payment to Firestore:", err);
+        });
+      }
+      return updated;
+    });
+  };
+
+  const reversePayment = (recordId: string, paymentId: string) => {
+    if (!confirm(isUrdu ? 'کیا آپ واقعی اس ادائیگی کو منسوخ کرنا چاہتے ہیں؟' : 'Are you sure you want to reverse this payment?')) return;
+    setRecords(prev => {
+      const updated = prev.map(r => {
+        if (r.id === recordId && r.type === 'supplier') {
+          const supplier = r as SupplierRecord;
+          const currentPayments = supplier.payments || [];
+          const targetPayment = currentPayments.find(p => p.id === paymentId);
+          if (!targetPayment) return r;
+
+          const reversal = {
+            id: 'rev_' + Math.random().toString(36).substr(2, 9),
+            amount: targetPayment.amount,
+            date: format(new Date(), 'yyyy-MM-dd'),
+            method: targetPayment.method,
+            note: isUrdu ? 'منسوخ شدہ ادائیگی' : `Reversed payment`,
+            reversesPaymentId: targetPayment.id,
+            createdAt: new Date().toISOString()
+          };
+
+          const updatedPayments = [...currentPayments, reversal];
+          const tempSupplier = { ...supplier, payments: updatedPayments };
+          const calcs = getSupplierDueCalculations(tempSupplier, new Date());
+
+          return {
+            ...supplier,
+            payments: updatedPayments,
+            status: calcs.status === 'settled' ? 'paid' : 'pending'
+          } as AppRecord;
+        }
+        return r;
+      });
+
+      const target = updated.find(r => r.id === recordId);
+      if (target && user) {
+        saveRecordToFirebase(user.uid, target).catch(err => {
+          console.error("Failed to save reversal to Firestore:", err);
         });
       }
       return updated;
@@ -464,6 +580,8 @@ export default function App() {
                   settings={settings}
                   onMarkPaid={markAsPaid}
                   onDelete={deleteRecord}
+                  onRecordPayment={record.type === 'supplier' ? () => setPaymentRecord(record as SupplierRecord) : undefined}
+                  onReversePayment={reversePayment}
                 />
               ))
             )}
@@ -497,6 +615,17 @@ export default function App() {
             onAdd={addRecord} 
             activeTab={activeTab} 
             t={t}
+            isUrdu={isUrdu}
+          />
+        )}
+        {paymentRecord && (
+          <RecordPaymentModal
+            record={paymentRecord}
+            onClose={() => setPaymentRecord(null)}
+            onRecord={(payment) => {
+              recordPayment(paymentRecord.id, payment);
+              setPaymentRecord(null);
+            }}
             isUrdu={isUrdu}
           />
         )}
@@ -568,22 +697,42 @@ function RecordBubble({
   record, 
   settings, 
   onMarkPaid,
-  onDelete 
+  onDelete,
+  onRecordPayment,
+  onReversePayment
 }: { 
   key?: string;
   record: AppRecord;
   settings: AppSettings;
   onMarkPaid: (id: string) => void;
   onDelete: (id: string) => void;
+  onRecordPayment?: () => void;
+  onReversePayment?: (recordId: string, paymentId: string) => void;
 }) {
   const [showOptions, setShowOptions] = useState(false);
   const [viewFullImage, setViewFullImage] = useState(false);
+  const [showPayments, setShowPayments] = useState(false);
   const t = TRANSLATIONS[settings.language];
   const isUrdu = settings.language === 'ur';
 
+  const isSupplier = record.type === 'supplier';
+  const supplierRecord = record as SupplierRecord;
+  const calcs = isSupplier ? getSupplierDueCalculations(supplierRecord, new Date()) : null;
+
+  const isPaid = isSupplier ? calcs?.status === 'settled' : record.status === 'paid';
+  const displayAmount = isSupplier ? calcs?.remaining : record.amount;
+  const originalAmount = isSupplier ? calcs?.originalAmount : record.amount;
+  const paidAmount = isSupplier ? calcs?.paid : 0;
+
   const getStatusColor = () => {
-    if (record.status === 'paid') return 'bg-[#111b21] text-[#8696a0] border-white/5';
+    if (isPaid) return 'bg-[#111b21] text-[#8696a0] border-white/5';
     
+    if (isSupplier && calcs) {
+      if (calcs.status === 'due-today') return 'bg-[#5c4b00] text-[#fecb00] border-white/10';
+      if (calcs.status === 'overdue') return 'bg-[#4b1c1c] text-[#ff6a6a] border-white/10';
+      return 'bg-[#005c4b] text-[#00a884] border-white/10';
+    }
+
     const dueDate = parseISO(record.dueDate);
     if (isToday(dueDate)) return 'bg-[#5c4b00] text-[#fecb00] border-white/10';
     if (isPast(dueDate)) return 'bg-[#4b1c1c] text-[#ff6a6a] border-white/10';
@@ -591,7 +740,17 @@ function RecordBubble({
   };
 
   const getDaysInfo = () => {
-    if (record.status === 'paid') return null;
+    if (isPaid) return null;
+    
+    if (isSupplier && calcs) {
+      if (calcs.status === 'due-today') return t.dueToday;
+      if (calcs.status === 'overdue') {
+        const d = Math.abs(calcs.daysDiff);
+        return isUrdu ? `میعاد ختم (${d} دن)` : `OVERDUE (${d} days)`;
+      }
+      return isUrdu ? `${calcs.daysDiff} دن باقی` : `DUE IN ${calcs.daysDiff} DAYS`;
+    }
+
     const today = new Date();
     const dueDate = parseISO(record.dueDate);
     const diff = differenceInDays(dueDate, today);
@@ -602,15 +761,31 @@ function RecordBubble({
   };
 
   const handleCall = () => {
-    if (record.type === 'customer') {
-      window.location.href = `tel:${record.phoneNumber}`;
+    const phone = isSupplier ? supplierRecord.phoneNumber : (record as CustomerRecord).phoneNumber;
+    if (phone) {
+      window.location.href = `tel:${phone}`;
     }
   };
 
   const handleWhatsApp = () => {
-    if (record.type === 'customer') {
-      const msg = t.whatsappTemplate(record.customerName, settings.pharmacyName, record.amount);
-      window.open(`https://wa.me/${record.phoneNumber.replace(/[^0-9]/g, '')}?text=${encodeURIComponent(msg)}`);
+    if (isSupplier) {
+      const pList = supplierRecord.payments || [];
+      const lastPayment = pList[pList.length - 1];
+      let msg = '';
+      if (lastPayment) {
+        msg = isUrdu
+          ? `السلام علیکم، رسید نمبر ${record.id} مورخہ ${format(parseISO(record.date), 'd MMM')} کے عوض Rs. ${lastPayment.amount.toLocaleString()} کی ادائیگی کی تصدیق کی جاتی ہے۔ بقایا رقم Rs. ${displayAmount?.toLocaleString()} ہے۔`
+          : `Assalam-o-Alaikum, confirming payment of Rs. ${lastPayment.amount.toLocaleString()} against invoice ${record.id} dated ${format(parseISO(record.date), 'd MMM')}. Remaining balance is Rs. ${displayAmount?.toLocaleString()}.`;
+      } else {
+        msg = isUrdu
+          ? `السلام علیکم، بل نمبر ${record.id} مورخہ ${format(parseISO(record.date), 'd MMM')} کے تحت Rs. ${displayAmount?.toLocaleString()} واجب الادا ہیں، برائے مہربانی چیک کریں۔`
+          : `Assalam-o-Alaikum, Rs. ${displayAmount?.toLocaleString()} is outstanding against invoice ${record.id} dated ${format(parseISO(record.date), 'd MMM')}. Please check.`;
+      }
+      const phone = supplierRecord.phoneNumber || '';
+      window.open(`https://wa.me/${phone.replace(/[^0-9]/g, '')}?text=${encodeURIComponent(msg)}`);
+    } else {
+      const msg = t.whatsappTemplate((record as CustomerRecord).customerName, settings.pharmacyName, record.amount);
+      window.open(`https://wa.me/${(record as CustomerRecord).phoneNumber.replace(/[^0-9]/g, '')}?text=${encodeURIComponent(msg)}`);
     }
   };
 
@@ -622,26 +797,41 @@ function RecordBubble({
       className={cn(
         "max-w-[88%] p-3.5 rounded-2xl shadow-md border border-white/5 relative group",
         record.type === 'customer' ? "ml-auto bg-[#005c4b] rounded-tr-none" : "mr-auto bg-[#202c33] rounded-tl-none",
-        record.status === 'paid' && "opacity-60 bg-[#111b21] border-white/5"
+        isPaid && "opacity-60 bg-[#111b21] border-white/5"
       )}
     >
       <div className="flex justify-between items-start mb-2 gap-4">
         <div>
           <h3 className={cn("font-bold text-sm", record.type === 'customer' ? "text-[#e9edef]" : "text-[#00a884]")}>
-            {record.type === 'customer' ? record.customerName : record.supplierName}
+            {record.type === 'customer' ? (record as CustomerRecord).customerName : supplierRecord.supplierName}
+            {isSupplier && supplierRecord.phoneNumber && (
+              <span className="text-[#8696a0] font-normal text-xs ml-1 font-mono"> · {supplierRecord.phoneNumber}</span>
+            )}
           </h3>
           {record.type === 'customer' && (
-            <p className="text-[10px] text-[#8696a0] font-mono mt-0.5 tracking-tight">{record.phoneNumber}</p>
+            <p className="text-[10px] text-[#8696a0] font-mono mt-0.5 tracking-tight">{(record as CustomerRecord).phoneNumber}</p>
           )}
         </div>
         <div className="flex items-start gap-2">
           <div className="text-right">
-            <p className="font-bold text-base text-[#e9edef]">Rs. {record.amount.toLocaleString()}</p>
+            {isSupplier && originalAmount !== displayAmount ? (
+              <div className="flex flex-col">
+                <span className="text-[9px] text-[#8696a0] line-through">Rs. {originalAmount?.toLocaleString()}</span>
+                <span className="font-bold text-sm text-[#e9edef]">
+                  Rs. <span className="text-base text-[#00a884] font-extrabold">{displayAmount?.toLocaleString()}</span> {isUrdu ? 'باقی' : 'baqi'}
+                </span>
+              </div>
+            ) : (
+              <p className="font-bold text-base text-[#e9edef]">
+                Rs. {displayAmount?.toLocaleString()}
+                {isSupplier && <span className="text-xs font-normal text-[#8696a0] ml-1"> {isUrdu ? 'باقی' : 'baqi'}</span>}
+              </p>
+            )}
           </div>
           <div className="relative">
             <button 
               onClick={() => setShowOptions(!showOptions)}
-              className="p-1 text-[#8696a0] hover:text-[#e9edef] transition-colors"
+              className="p-1 text-[#8696a0] hover:text-[#e9edef] transition-colors cursor-pointer"
             >
               <MoreVertical size={18} />
             </button>
@@ -657,7 +847,7 @@ function RecordBubble({
                   >
                     <button 
                       onClick={() => { onDelete(record.id); setShowOptions(false); }}
-                      className="w-full text-left px-4 py-2 text-xs text-red-400 hover:bg-white/5 flex items-center gap-2"
+                      className="w-full text-left px-4 py-2 text-xs text-red-400 hover:bg-white/5 flex items-center gap-2 cursor-pointer"
                     >
                       <Trash2 size={14} />
                       {settings.language === 'ur' ? 'حذف کریں' : 'Delete'}
@@ -669,6 +859,27 @@ function RecordBubble({
           </div>
         </div>
       </div>
+
+      <div className="text-[10px] text-[#8696a0] mb-3 flex items-center gap-1.5 font-medium">
+        <span>{isUrdu ? 'لیا گیا:' : 'Taken:'} <strong className="text-[#e9edef] font-semibold">{format(parseISO(record.date), 'd MMM')}</strong></span>
+        <span className="opacity-40">·</span>
+        <span>{isUrdu ? 'تاریخ واپسی:' : 'Due:'} <strong className="text-[#e9edef] font-semibold">{format(parseISO(record.dueDate), 'd MMM')}</strong></span>
+      </div>
+
+      {isSupplier && (
+        <div className="mb-3 bg-black/20 p-2.5 rounded-2xl border border-white/5">
+          <div className="flex justify-between text-[10px] text-[#8696a0] font-semibold mb-1">
+            <span>Rs. {paidAmount?.toLocaleString()} {isUrdu ? 'ادا شدہ' : 'paid'}</span>
+            <span>{Math.round(originalAmount && originalAmount > 0 ? (paidAmount! / originalAmount) * 100 : 0)}%</span>
+          </div>
+          <div className="w-full bg-white/5 rounded-full h-1.5 overflow-hidden border border-white/5">
+            <div 
+              className="bg-[#00a884] h-full rounded-full transition-all duration-300" 
+              style={{ width: `${originalAmount && originalAmount > 0 ? (paidAmount! / originalAmount) * 100 : 0}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {record.type === 'supplier' && record.items && record.items.length > 0 ? (
         <div className="bg-black/20 rounded-2xl p-3 border border-white/5 space-y-2 mb-3">
@@ -720,14 +931,6 @@ function RecordBubble({
             <span>{record.quantity}</span>
           </div>
         )}
-        <div className="bg-black/20 px-2 py-1 rounded flex items-center gap-1.5 border border-white/5">
-          <Clock size={10} className="text-[#8696a0]" />
-          <span className="text-[#8696a0]">{format(parseISO(record.date), 'dd MMM')}</span>
-        </div>
-        <div className="bg-black/20 px-2 py-1 rounded flex items-center gap-1.5 border border-[#8696a0]/20">
-          <Bell size={10} className="text-[#8696a0]" />
-          <span className="text-[#8696a0]">{format(parseISO(record.dueDate), 'dd MMM')}</span>
-        </div>
         {getDaysInfo() && (
           <span className={cn("px-2 py-1 rounded border font-bold uppercase tracking-wider", getStatusColor())}>
             {getDaysInfo()}
@@ -735,19 +938,91 @@ function RecordBubble({
         )}
       </div>
 
+      {isSupplier && supplierRecord.payments && supplierRecord.payments.length > 0 && (
+        <div className="mb-3">
+          <button 
+            type="button"
+            onClick={() => setShowPayments(!showPayments)}
+            className="text-[10px] text-[#00a884] font-bold flex items-center gap-1 hover:underline cursor-pointer"
+          >
+            <span>{supplierRecord.payments.length} {isUrdu ? 'ادائیگیاں' : 'payments'}</span>
+            <span>{showPayments ? '▴' : '▾'}</span>
+          </button>
+          <AnimatePresence>
+            {showPayments && (
+              <motion.div 
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                className="overflow-hidden space-y-1.5 mt-2 bg-black/10 p-2.5 rounded-2xl border border-white/5 text-[11px]"
+              >
+                {(() => {
+                  const reversedIds = new Set<string>();
+                  supplierRecord.payments.forEach(p => {
+                    if (p.reversesPaymentId) {
+                      reversedIds.add(p.reversesPaymentId);
+                    }
+                  });
+
+                  return supplierRecord.payments.map((p) => {
+                    const isReversed = reversedIds.has(p.id);
+                    const isReversal = !!p.reversesPaymentId;
+
+                    return (
+                      <div 
+                        key={p.id} 
+                        className={cn(
+                          "flex justify-between items-center text-[#d1d7db] py-1 border-b border-white/5 last:border-0",
+                          isReversed && "line-through text-[#8696a0]/50"
+                        )}
+                      >
+                        <div>
+                          <span className="font-bold">Rs. {p.amount.toLocaleString()}</span>
+                          <span className="text-[9px] text-[#8696a0] ml-1.5 font-mono">({p.method || 'Cash'})</span>
+                          {p.note && <span className="text-[9px] text-[#8696a0] ml-1.5 italic">({p.note})</span>}
+                          {isReversed && (
+                            <span className="text-[8px] uppercase font-bold text-red-500 ml-1 bg-red-500/10 px-1 py-0.5 rounded border border-red-500/25 inline-block leading-none">
+                              {isUrdu ? 'منسوخ شدہ' : 'reversed'}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="text-[9px] text-[#8696a0] font-mono">{format(parseISO(p.date), 'dd MMM yyyy')}</span>
+                          {!isReversed && !isReversal && onReversePayment && calcs && calcs.status !== 'settled' && (
+                            <button 
+                              type="button"
+                              onClick={() => onReversePayment(record.id, p.id)}
+                              className="text-[9px] text-red-400 hover:text-red-300 font-bold px-1.5 py-0.5 bg-red-500/10 border border-red-500/20 rounded cursor-pointer active:scale-90 transition-all leading-none"
+                            >
+                              {isUrdu ? 'منسوخ' : 'Reverse'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  });
+                })()}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      )}
+
       <div className="flex items-center justify-between mt-1 pt-2.5 border-t border-white/5">
         <div className="flex gap-2">
-          {record.status !== 'paid' && record.type === 'customer' && (
+          {(!isPaid || isSupplier) && (
             <>
               <button 
                 onClick={handleCall}
-                className="w-9 h-9 rounded-full bg-[#2a3942] flex items-center justify-center text-[#e9edef] hover:bg-[#3b4a54] transition-colors border border-white/5 active:scale-90"
+                className="w-9 h-9 rounded-full bg-[#2a3942] flex items-center justify-center text-[#e9edef] hover:bg-[#3b4a54] transition-colors border border-white/5 active:scale-90 cursor-pointer"
+                title={isUrdu ? 'کال کریں' : 'Call'}
               >
                 <Phone size={14} />
                </button>
               <button 
                 onClick={handleWhatsApp}
-                className="w-9 h-9 rounded-full bg-[#2a3942] flex items-center justify-center text-[#00a884] hover:bg-[#3b4a54] transition-colors border border-white/5 active:scale-90"
+                className="w-9 h-9 rounded-full bg-[#2a3942] flex items-center justify-center text-[#00a884] hover:bg-[#3b4a54] transition-colors border border-white/5 active:scale-90 cursor-pointer"
+                title={isUrdu ? 'واٹس ایپ' : 'WhatsApp'}
               >
                 <MessageCircle size={14} />
               </button>
@@ -755,19 +1030,36 @@ function RecordBubble({
           )}
         </div>
         
-        {record.status !== 'paid' ? (
-          <button 
-            onClick={() => onMarkPaid(record.id)}
-            className="flex items-center gap-1.5 bg-[#00a884] text-white px-4 py-2 rounded-xl text-xs font-bold shadow-md hover:bg-[#00c99a] active:scale-95 transition-all"
-          >
-            <CheckCircle2 size={13} />
-            {t.markPaid}
-          </button>
+        {isSupplier ? (
+          !isPaid ? (
+            <button 
+              onClick={onRecordPayment}
+              className="flex items-center gap-1.5 bg-[#00a884] text-white px-4 py-2 rounded-xl text-xs font-bold shadow-md hover:bg-[#00c99a] active:scale-95 transition-all cursor-pointer"
+            >
+              <CheckCircle2 size={13} />
+              {isUrdu ? 'ادائیگی درج کریں' : 'Record payment'}
+            </button>
+          ) : (
+            <div className="flex items-center gap-1.5 text-[#00a884] font-bold text-[10px] uppercase tracking-widest italic bg-[#00a884]/10 px-3 py-1 rounded-full border border-[#00a884]/20">
+              <CheckCircle2 size={13} />
+              {isUrdu ? 'بےباق' : 'SETTLED'}
+            </div>
+          )
         ) : (
-          <div className="flex items-center gap-1.5 text-[#00a884] font-bold text-[10px] uppercase tracking-widest italic bg-[#00a884]/10 px-3 py-1 rounded-full border border-[#00a884]/20">
-            <CheckCircle2 size={13} />
-            {t.cleared}
-          </div>
+          !isPaid ? (
+            <button 
+              onClick={() => onMarkPaid(record.id)}
+              className="flex items-center gap-1.5 bg-[#00a884] text-white px-4 py-2 rounded-xl text-xs font-bold shadow-md hover:bg-[#00c99a] active:scale-95 transition-all cursor-pointer"
+            >
+              <CheckCircle2 size={13} />
+              {t.markPaid}
+            </button>
+          ) : (
+            <div className="flex items-center gap-1.5 text-[#00a884] font-bold text-[10px] uppercase tracking-widest italic bg-[#00a884]/10 px-3 py-1 rounded-full border border-[#00a884]/20">
+              <CheckCircle2 size={13} />
+              {t.cleared}
+            </div>
+          )
         )}
       </div>
 
@@ -1146,6 +1438,154 @@ function AddRecordModal({
   );
 }
 
+function RecordPaymentModal({
+  record,
+  onClose,
+  onRecord,
+  isUrdu
+}: {
+  record: SupplierRecord,
+  onClose: () => void,
+  onRecord: (p: { amount: number; date: string; method: string; note?: string }) => void,
+  isUrdu: boolean
+}) {
+  const calcs = getSupplierDueCalculations(record, new Date());
+  const maxAmount = calcs.remaining;
+
+  const [formData, setFormData] = useState({
+    amount: maxAmount.toString(),
+    date: format(new Date(), 'yyyy-MM-dd'),
+    method: 'Cash',
+    note: ''
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const payAmount = Number(formData.amount);
+    if (isNaN(payAmount) || payAmount <= 0) {
+      alert(isUrdu ? 'براہ کرم درست رقم درج کریں' : 'Please enter a valid amount');
+      return;
+    }
+    if (payAmount > maxAmount) {
+      alert(isUrdu 
+        ? `ادائیگی کی رقم باقی بقایا رقم (Rs. ${maxAmount.toLocaleString()}) سے زیادہ نہیں ہو سکتی` 
+        : `Payment amount cannot exceed remaining balance (Rs. ${maxAmount.toLocaleString()})`
+      );
+      return;
+    }
+
+    onRecord({
+      amount: payAmount,
+      date: formData.date,
+      method: formData.method,
+      note: formData.note.trim() || undefined
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[60] flex items-end sm:items-center justify-center p-0 sm:p-4">
+      <motion.div 
+        initial={{ y: "100%" }}
+        animate={{ y: 0 }}
+        exit={{ y: "100%" }}
+        transition={{ type: "spring", damping: 25, stiffness: 300 }}
+        className="bg-[#202c33] w-full max-w-lg rounded-t-3xl sm:rounded-3xl pb-10 sm:pb-6 overflow-hidden border-t sm:border border-white/10 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]"
+      >
+        <div className="bg-[#2a3942] p-5 text-[#e9edef] flex justify-between items-center border-b border-white/5">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-[#00a884]/20 rounded-xl flex items-center justify-center text-[#00a884]">
+              <CheckCircle2 size={20} />
+            </div>
+            <div>
+              <h2 className="font-bold text-base leading-tight">
+                {isUrdu ? 'ادائیگی درج کریں' : 'Record Payment'}
+              </h2>
+              <p className="text-[10px] text-[#8696a0] font-bold uppercase tracking-wider">
+                {record.supplierName}
+              </p>
+            </div>
+          </div>
+          <button type="button" onClick={onClose} className="p-2 hover:bg-white/10 rounded-full transition-colors cursor-pointer"><X size={20} /></button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="p-5 space-y-5">
+          <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
+            <div className="bg-black/10 p-4 rounded-2xl border border-white/5 flex justify-between items-center">
+              <span className="text-xs text-[#8696a0]">
+                {isUrdu ? 'کل بقایا رقم' : 'Remaining Balance'}
+              </span>
+              <span className="font-bold text-base text-[#00a884] font-mono">
+                Rs. {maxAmount.toLocaleString()}
+              </span>
+            </div>
+
+            <div>
+              <label className="text-[10px] font-bold text-[#8696a0] uppercase tracking-widest block mb-2 px-1">
+                {isUrdu ? 'ادائیگی کی رقم' : 'Payment Amount'}
+              </label>
+              <input 
+                type="number"
+                required
+                autoFocus
+                className="w-full bg-[#2a3942] border border-white/5 rounded-2xl px-5 py-4 text-[#e9edef] text-lg outline-none focus:border-[#00a884] transition-all font-bold"
+                placeholder="0"
+                value={formData.amount}
+                onChange={e => setFormData({ ...formData, amount: e.target.value })}
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="text-[10px] font-bold text-[#8696a0] uppercase tracking-widest block mb-2 px-1">
+                  {isUrdu ? 'تاریخ' : 'Date'}
+                </label>
+                <input 
+                  type="date"
+                  required
+                  className="w-full bg-[#2a3942] border border-white/5 rounded-2xl px-5 py-4 text-[#e9edef] text-sm outline-none focus:border-[#00a884] transition-all [color-scheme:dark]"
+                  value={formData.date}
+                  onChange={e => setFormData({ ...formData, date: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="text-[10px] font-bold text-[#8696a0] uppercase tracking-widest block mb-2 px-1">
+                  {isUrdu ? 'طریقہ کار' : 'Method'}
+                </label>
+                <select 
+                  className="w-full bg-[#2a3942] border border-white/5 rounded-2xl px-5 py-4 text-[#e9edef] text-sm outline-none focus:border-[#00a884] transition-all"
+                  value={formData.method}
+                  onChange={e => setFormData({ ...formData, method: e.target.value })}
+                >
+                  <option value="Cash">{isUrdu ? 'نقد (Cash)' : 'Cash'}</option>
+                  <option value="Bank Transfer">{isUrdu ? 'بینک ٹرانسفر' : 'Bank Transfer'}</option>
+                  <option value="Cheque">{isUrdu ? 'چیک (Cheque)' : 'Cheque'}</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="text-[10px] font-bold text-[#8696a0] uppercase tracking-widest block mb-2 px-1">
+                {isUrdu ? 'تفصیل (اختیاری)' : 'Note (Optional)'}
+              </label>
+              <textarea 
+                className="w-full bg-[#2a3942] border border-white/5 rounded-2xl px-5 py-3 text-[#e9edef] text-sm outline-none focus:border-[#00a884] transition-all min-h-[70px] resize-none placeholder:text-[#8696a0]/30"
+                placeholder={isUrdu ? 'ادائیگی کی تفصیل یہاں درج کریں...' : 'Enter details here...'}
+                value={formData.note}
+                onChange={e => setFormData({ ...formData, note: e.target.value })}
+              />
+            </div>
+          </div>
+
+          <button className="w-full bg-[#00a884] text-white py-4.5 rounded-2xl font-bold text-lg shadow-[0_8px_20px_rgba(0,168,132,0.3)] hover:bg-[#00c99a] active:scale-[0.98] transition-all flex items-center justify-center gap-3 mt-6 cursor-pointer">
+            {isUrdu ? 'ادائیگی محفوظ کریں' : 'Record Payment'}
+            <ArrowRight size={22} className={cn(isUrdu && "rotate-180")} />
+          </button>
+        </form>
+      </motion.div>
+    </div>
+  );
+}
+
 function SettingsPanel({ 
   settings, 
   setSettings, 
@@ -1269,13 +1709,31 @@ function SettingsPanel({
 
   const supplierSummary = useMemo(() => {
     return records
-      .filter(r => r.type === 'supplier' && r.status !== 'paid')
+      .filter(r => r.type === 'supplier')
       .map(r => {
-        const diff = differenceInDays(parseISO(r.dueDate), new Date());
-        return { ...r, daysLeft: diff };
+        const calcs = getSupplierDueCalculations(r as SupplierRecord, new Date());
+        return { 
+          ...r, 
+          remaining: calcs.remaining,
+          status: calcs.status,
+          daysLeft: calcs.daysDiff 
+        };
       })
+      .filter(s => s.status !== 'settled')
       .sort((a, b) => a.daysLeft - b.daysLeft);
   }, [records]);
+
+  const { totalOutstanding, totalDueToday } = useMemo(() => {
+    let outstanding = 0;
+    let dueToday = 0;
+    supplierSummary.forEach(s => {
+      outstanding += s.remaining;
+      if (s.status === 'due-today' || s.daysLeft === 0) {
+        dueToday += s.remaining;
+      }
+    });
+    return { totalOutstanding: outstanding, totalDueToday: dueToday };
+  }, [supplierSummary]);
 
   return (
     <motion.div 
@@ -1292,6 +1750,26 @@ function SettingsPanel({
             </div>
             <h3 className="font-bold text-sm tracking-wide">{t.summaryTitle}</h3>
           </div>
+
+          <div className="grid grid-cols-2 gap-3 p-4 bg-[#111b21]/50 border-b border-white/5">
+            <div className="bg-[#111b21] p-3 rounded-2xl border border-white/5">
+              <span className="text-[10px] text-[#8696a0] uppercase font-bold tracking-wider block">
+                {settings.language === 'ur' ? 'کل واجب الادا رقم' : 'Total Outstanding'}
+              </span>
+              <span className="text-base font-extrabold text-[#e9edef] mt-0.5 block">
+                Rs. {totalOutstanding.toLocaleString()}
+              </span>
+            </div>
+            <div className="bg-[#111b21] p-3 rounded-2xl border border-white/5">
+              <span className="text-[10px] text-yellow-500 uppercase font-bold tracking-wider block">
+                {settings.language === 'ur' ? 'آج واجب الادا' : 'Due Today'}
+              </span>
+              <span className="text-base font-extrabold text-yellow-500 mt-0.5 block">
+                Rs. {totalDueToday.toLocaleString()}
+              </span>
+            </div>
+          </div>
+
           <div className="overflow-x-auto">
             <table className={cn("w-full text-sm", isUrdu && "text-right")}>
               <thead>
@@ -1305,7 +1783,7 @@ function SettingsPanel({
                 {supplierSummary.map((s: any) => (
                   <tr key={s.id} className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] transition-colors">
                     <td className="px-5 py-4 font-medium text-[#e9edef]">{s.supplierName}</td>
-                    <td className="px-5 py-4 text-[#00a884] font-bold text-base">Rs. {s.amount.toLocaleString()}</td>
+                    <td className="px-5 py-4 text-[#00a884] font-bold text-base">Rs. {s.remaining.toLocaleString()}</td>
                     <td className="px-5 py-4">
                       <span className={cn(
                         "px-3 py-1 rounded-full text-[9px] font-bold uppercase tracking-wider inline-block border",
