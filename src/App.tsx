@@ -25,7 +25,9 @@ import {
   Check,
   RefreshCw,
   ExternalLink,
-  Paperclip
+  Paperclip,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { format, isToday, isPast, isBefore, addDays, parseISO, differenceInDays } from 'date-fns';
@@ -294,6 +296,66 @@ export default function App() {
     });
   };
 
+  const markCustomerPaid = async (customerName: string, phoneNumber: string) => {
+    const unpaidRecords = records.filter(r => 
+      r.type === 'customer' && 
+      r.customerName === customerName && 
+      r.phoneNumber === phoneNumber && 
+      r.status !== 'paid'
+    ) as CustomerRecord[];
+
+    const totalAmount = unpaidRecords.reduce((sum, r) => sum + r.amount, 0);
+
+    const confirmMsg = isUrdu
+      ? `کیا آپ واقعی اس گاہک (${customerName}) کی کل وصولی Rs. ${totalAmount.toLocaleString()} کو کلیئر کرنا چاہتے ہیں؟`
+      : `Are you sure you want to clear the total outstanding amount of Rs. ${totalAmount.toLocaleString()} for ${customerName}?`;
+
+    if (confirm(confirmMsg)) {
+      setRecords(prev => {
+        const updated = prev.map(r => {
+          if (r.type === 'customer' && r.customerName === customerName && r.phoneNumber === phoneNumber && r.status !== 'paid') {
+            return { ...r, status: 'paid' as const };
+          }
+          return r;
+        });
+
+        // Sync to Firestore
+        if (user) {
+          unpaidRecords.forEach(r => {
+            const updatedRecord = { ...r, status: 'paid' as const };
+            saveRecordToFirebase(user.uid, updatedRecord).catch(err => {
+              console.error("Failed to sync paid record to Firestore:", err);
+            });
+          });
+        }
+
+        return updated;
+      });
+    }
+  };
+
+  const deleteCustomerGroup = async (customerName: string, phoneNumber: string) => {
+    const confirmMsg = isUrdu 
+      ? `کیا آپ واقعی اس گاہک (${customerName}) کے تمام بقایا ریکارڈز کو حذف کرنا چاہتے ہیں؟`
+      : `Are you sure you want to delete all outstanding records for customer ${customerName}?`;
+    
+    if (confirm(confirmMsg)) {
+      const toDelete = records.filter(r => r.type === 'customer' && r.customerName === customerName && r.phoneNumber === phoneNumber);
+      
+      setRecords(prev => prev.filter(r => !(r.type === 'customer' && r.customerName === customerName && r.phoneNumber === phoneNumber)));
+      
+      if (user) {
+        for (const r of toDelete) {
+          try {
+            await deleteRecordFromFirebase(user.uid, r.id);
+          } catch (err) {
+            console.error("Failed to delete record from Firestore:", err);
+          }
+        }
+      }
+    }
+  };
+
   const recordPayment = (recordId: string, payment: { amount: number; date: string; method: string; note?: string }) => {
     setRecords(prev => {
       const updated = prev.map(r => {
@@ -389,12 +451,41 @@ export default function App() {
     setSettings(prev => ({ ...prev, language: prev.language === 'en' ? 'ur' : 'en' }));
   };
 
+  // Group customers by name and phone to show "current due" instead of thread history
+  const groupedCustomers = useMemo(() => {
+    if (activeTab !== 'customers') return [];
+    const customerRecords = records.filter(r => r.type === 'customer' && r.status !== 'paid') as CustomerRecord[];
+    
+    const groups: { [key: string]: CustomerRecord[] } = {};
+    customerRecords.forEach(r => {
+      const key = `${r.customerName.trim().toLowerCase()}_${r.phoneNumber.trim()}`;
+      if (!groups[key]) {
+        groups[key] = [];
+      }
+      groups[key].push(r);
+    });
+    
+    return Object.values(groups).map(groupRecords => {
+      const sorted = [...groupRecords].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      const totalAmount = sorted.reduce((sum, r) => sum + r.amount, 0);
+      const earliestDue = [...groupRecords].sort((a, b) => new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime())[0]?.dueDate;
+      const primaryRecord = sorted[0];
+      
+      return {
+        id: `group_${primaryRecord.id}`,
+        customerName: primaryRecord.customerName,
+        phoneNumber: primaryRecord.phoneNumber,
+        totalAmount,
+        records: sorted,
+        earliestDueDate: earliestDue,
+        latestDate: primaryRecord.date
+      };
+    }).sort((a, b) => new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime());
+  }, [records, activeTab]);
+
   // View records filter
   const filteredRecords = useMemo(() => {
     return records.filter(r => {
-      if (activeTab === 'customers') {
-        return r.type === 'customer' && r.status !== 'paid';
-      }
       if (activeTab === 'suppliers') {
         const isSupplier = r.type === 'supplier';
         if (isSupplier) {
@@ -570,7 +661,8 @@ export default function App() {
       <main className="flex-1 overflow-y-auto px-4 py-4 mb-20 space-y-5 scroll-smooth">
         {activeTab !== 'settings' && (
           <AnimatePresence mode="popLayout">
-            {filteredRecords.length === 0 ? (
+            {((activeTab === 'customers' && groupedCustomers.length === 0) || 
+              (activeTab === 'suppliers' && filteredRecords.length === 0)) ? (
               <motion.div 
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
@@ -581,6 +673,16 @@ export default function App() {
                   <p className="text-sm font-medium">{t.noRecords}</p>
                 </div>
               </motion.div>
+            ) : activeTab === 'customers' ? (
+              groupedCustomers.map((group) => (
+                <CustomerGroupBubble 
+                  key={group.id} 
+                  group={group} 
+                  settings={settings}
+                  onMarkCustomerPaid={markCustomerPaid}
+                  onDeleteCustomerGroup={deleteCustomerGroup}
+                />
+              ))
             ) : (
               filteredRecords.map((record) => (
                 <RecordBubble 
@@ -699,6 +801,257 @@ function NavButton({ active, onClick, icon, label }: { active: boolean, onClick:
         />
       )}
     </button>
+  );
+}
+
+interface GroupedCustomerData {
+  id: string;
+  customerName: string;
+  phoneNumber: string;
+  totalAmount: number;
+  records: CustomerRecord[];
+  earliestDueDate: string;
+  latestDate: string;
+}
+
+function CustomerGroupBubble({
+  group,
+  settings,
+  onMarkCustomerPaid,
+  onDeleteCustomerGroup
+}: {
+  key?: string;
+  group: GroupedCustomerData;
+  settings: AppSettings;
+  onMarkCustomerPaid: (name: string, phone: string) => void;
+  onDeleteCustomerGroup: (name: string, phone: string) => void;
+}) {
+  const [showOptions, setShowOptions] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [viewFullImage, setViewFullImage] = useState<string | null>(null);
+  const [viewFullImageName, setViewFullImageName] = useState<string>('');
+  
+  const t = TRANSLATIONS[settings.language];
+  const isUrdu = settings.language === 'ur';
+
+  const getGroupDaysInfo = () => {
+    const today = new Date();
+    const dueDate = parseISO(group.earliestDueDate);
+    const diff = differenceInDays(dueDate, today);
+    
+    if (diff === 0) return t.dueToday;
+    if (diff < 0) return `${Math.abs(diff)} ${t.daysOverdue}`;
+    return `${diff} ${t.daysLeft}`;
+  };
+
+  const getGroupStatusColor = () => {
+    const dueDate = parseISO(group.earliestDueDate);
+    if (isToday(dueDate)) return 'bg-[#5c4b00] text-[#fecb00] border-white/10';
+    if (isPast(dueDate)) return 'bg-[#4b1c1c] text-[#ff6a6a] border-white/10';
+    return 'bg-[#005c4b]/50 text-[#00a884] border-white/10';
+  };
+
+  const handleCall = () => {
+    if (group.phoneNumber) {
+      window.location.href = `tel:${group.phoneNumber}`;
+    }
+  };
+
+  const handleWhatsApp = () => {
+    const msg = t.whatsappTemplate(group.customerName, settings.pharmacyName, group.totalAmount);
+    window.open(`https://wa.me/${group.phoneNumber.replace(/[^0-9]/g, '')}?text=${encodeURIComponent(msg)}`);
+  };
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0, y: 10, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.9 }}
+      className="max-w-[88%] ml-auto p-3.5 rounded-2xl rounded-tr-none bg-[#005c4b] shadow-md border border-white/5 relative group"
+    >
+      <div className="flex justify-between items-start mb-2 gap-4">
+        <div>
+          <h3 className="font-bold text-sm text-[#e9edef]">
+            {group.customerName}
+          </h3>
+          <p className="text-[10px] text-[#8696a0] font-mono mt-0.5 tracking-tight">{group.phoneNumber}</p>
+        </div>
+        <div className="flex items-start gap-2">
+          <div className="text-right">
+            <p className="font-bold text-base text-[#e9edef]">
+              Rs. {group.totalAmount.toLocaleString()}
+            </p>
+            <p className="text-[9px] text-[#8696a0] font-bold uppercase tracking-wide">
+              {isUrdu ? 'کل ادھار' : 'Current Due'}
+            </p>
+          </div>
+          <div className="relative">
+            <button 
+              onClick={() => setShowOptions(!showOptions)}
+              className="p-1 text-[#8696a0] hover:text-[#e9edef] transition-colors cursor-pointer"
+            >
+              <MoreVertical size={18} />
+            </button>
+            <AnimatePresence>
+              {showOptions && (
+                <>
+                  <div className="fixed inset-0 z-10" onClick={() => setShowOptions(false)} />
+                  <motion.div 
+                    initial={{ opacity: 0, scale: 0.9, y: -10 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.9, y: -10 }}
+                    className="absolute right-0 top-full mt-1 bg-[#2a3942] border border-white/10 rounded-xl py-1 shadow-xl z-20 min-w-[120px]"
+                  >
+                    <button 
+                      onClick={() => { onDeleteCustomerGroup(group.customerName, group.phoneNumber); setShowOptions(false); }}
+                      className="w-full text-left px-4 py-2 text-xs text-red-400 hover:bg-white/5 flex items-center gap-2 cursor-pointer"
+                    >
+                      <Trash2 size={14} />
+                      {settings.language === 'ur' ? 'حذف کریں' : 'Delete'}
+                    </button>
+                  </motion.div>
+                </>
+              )}
+            </AnimatePresence>
+          </div>
+        </div>
+      </div>
+
+      <div className="text-[10px] text-[#8696a0] mb-3 flex items-center gap-1.5 font-medium">
+        <span>{isUrdu ? 'آخری تاریخ:' : 'Latest:'} <strong className="text-[#e9edef] font-semibold">{format(parseISO(group.latestDate), 'd MMM')}</strong></span>
+        <span className="opacity-40">·</span>
+        <span className={cn("px-1.5 py-0.5 rounded border text-[9px] font-bold uppercase tracking-wider", getGroupStatusColor())}>
+          {getGroupDaysInfo()}
+        </span>
+      </div>
+
+      {/* Collapsible breakdown of individual bills */}
+      <div className="mb-3">
+        <button 
+          type="button"
+          onClick={() => setShowDetails(!showDetails)}
+          className="w-full flex items-center justify-between text-[10px] text-[#e9edef]/80 hover:text-white font-bold py-2 px-3 bg-black/15 hover:bg-black/25 rounded-xl border border-white/5 transition-all cursor-pointer"
+        >
+          <span>
+            {isUrdu 
+              ? `${group.records.length} بلز کی تفصیل`
+              : `${group.records.length} Bills Details`}
+          </span>
+          {showDetails ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+        </button>
+        
+        <AnimatePresence>
+          {showDetails && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden space-y-2 mt-2 bg-black/20 p-2.5 rounded-2xl border border-white/5"
+            >
+              {group.records.map((r, idx) => {
+                const rDueDate = parseISO(r.dueDate);
+                const rOverdue = isPast(rDueDate) && !isToday(rDueDate);
+                return (
+                  <div key={r.id || idx} className="text-[11px] border-b border-white/5 last:border-0 pb-2 last:pb-0">
+                    <div className="flex justify-between items-start gap-2">
+                      <div className="font-semibold text-white truncate max-w-[65%]">
+                        {r.description || (isUrdu ? 'ادھار دوا' : 'Medicine Credit')}
+                      </div>
+                      <div className="text-[#00a884] font-extrabold font-mono whitespace-nowrap">
+                        Rs. {r.amount.toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="flex justify-between text-[9px] text-[#8696a0] mt-1">
+                      <span>{isUrdu ? 'تاریخ:' : 'Date:'} {format(parseISO(r.date), 'd MMM yyyy')}</span>
+                      <span className={cn(rOverdue && "text-red-400 font-bold")}>
+                        {isUrdu ? 'واپسی:' : 'Due:'} {format(parseISO(r.dueDate), 'd MMM yyyy')}
+                      </span>
+                    </div>
+                    {r.attachmentUrl && (
+                      <div className="mt-1.5 flex items-center justify-between gap-2 bg-black/15 p-1.5 rounded-xl border border-white/5">
+                        <span className="text-[9px] text-[#8696a0] truncate font-mono max-w-[60%]">{r.attachmentName || 'receipt.jpg'}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setViewFullImage(r.attachmentUrl!);
+                            setViewFullImageName(r.attachmentName || 'receipt.jpg');
+                          }}
+                          className="text-[9px] text-[#00a884] font-bold hover:underline cursor-pointer"
+                        >
+                          {t.viewAttachment}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      <div className="flex items-center justify-between mt-1 pt-2.5 border-t border-white/5">
+        <div className="flex gap-2">
+          <button 
+            onClick={handleCall}
+            className="w-9 h-9 rounded-full bg-[#2a3942] flex items-center justify-center text-[#e9edef] hover:bg-[#3b4a54] transition-colors border border-white/5 active:scale-90 cursor-pointer"
+            title={isUrdu ? 'کال کریں' : 'Call'}
+          >
+            <Phone size={14} />
+          </button>
+          <button 
+            onClick={handleWhatsApp}
+            className="w-9 h-9 rounded-full bg-[#2a3942] flex items-center justify-center text-[#00a884] hover:bg-[#3b4a54] transition-colors border border-white/5 active:scale-90 cursor-pointer"
+            title={isUrdu ? 'واٹس ایپ' : 'WhatsApp'}
+          >
+            <MessageCircle size={14} />
+          </button>
+        </div>
+        
+        <button 
+          onClick={() => onMarkCustomerPaid(group.customerName, group.phoneNumber)}
+          className="flex items-center gap-1.5 bg-[#00a884] text-white px-4 py-2 rounded-xl text-xs font-bold shadow-md hover:bg-[#00c99a] active:scale-95 transition-all cursor-pointer"
+        >
+          <CheckCircle2 size={13} />
+          {t.markPaid}
+        </button>
+      </div>
+
+      <span className="absolute bottom-1 right-2.5 text-[8px] text-[#8696a0] font-mono opacity-40">
+        {format(new Date(), 'HH:mm')}
+      </span>
+
+      {/* Lightbox Modal */}
+      <AnimatePresence>
+        {viewFullImage && (
+          <div className="fixed inset-0 bg-black/90 backdrop-blur-md z-[100] flex flex-col items-center justify-center p-4">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="max-w-3xl w-full max-h-[85vh] flex items-center justify-center relative rounded-3xl overflow-hidden shadow-2xl border border-white/10 bg-[#111b21]"
+            >
+              <img 
+                src={viewFullImage} 
+                alt={viewFullImageName} 
+                className="max-w-full max-h-[80vh] object-contain"
+                referrerPolicy="no-referrer"
+              />
+              <button 
+                type="button"
+                onClick={() => setViewFullImage(null)}
+                className="absolute top-4 right-4 bg-black/60 hover:bg-black/80 text-white rounded-full p-2 transition-colors border border-white/10 active:scale-90 cursor-pointer"
+              >
+                <X size={20} />
+              </button>
+            </motion.div>
+            <p className="mt-4 text-xs font-mono text-[#8696a0] bg-[#202c33] px-4 py-2 rounded-full border border-white/5">
+              {viewFullImageName}
+            </p>
+          </div>
+        )}
+      </AnimatePresence>
+    </motion.div>
   );
 }
 
@@ -1635,7 +1988,7 @@ function SettingsPanel({
 
   const handleGoogleSignIn = async () => {
     try {
-      const result = await googleSignIn();
+      const result = await googleSignIn(true);
       if (result) {
         setUser(result.user);
         setAccessToken(result.accessToken);

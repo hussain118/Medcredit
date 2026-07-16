@@ -6,10 +6,6 @@ import firebaseConfig from '../firebase-applet-config.json';
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 
-const provider = new GoogleAuthProvider();
-// Request Google Sheets scopes
-provider.addScope('https://www.googleapis.com/auth/spreadsheets');
-
 // Cache the access token in memory and local storage for persistence
 let cachedAccessToken: string | null = localStorage.getItem('google_access_token');
 let isSigningIn = false;
@@ -34,9 +30,13 @@ export const initAuth = (
 };
 
 // Must be called from a button click or user interaction
-export const googleSignIn = async (): Promise<{ user: User; accessToken: string | null } | null> => {
+export const googleSignIn = async (requestSheetsScope = false): Promise<{ user: User; accessToken: string | null } | null> => {
   try {
     isSigningIn = true;
+    const provider = new GoogleAuthProvider();
+    if (requestSheetsScope) {
+      provider.addScope('https://www.googleapis.com/auth/spreadsheets');
+    }
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     
@@ -44,7 +44,7 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
     if (token) {
       cachedAccessToken = token;
       localStorage.setItem('google_access_token', token);
-    } else {
+    } else if (requestSheetsScope) {
       console.warn('No Google Sheets access token retrieved during login.');
     }
 
