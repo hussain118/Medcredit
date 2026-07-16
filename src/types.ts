@@ -118,6 +118,8 @@ export const TRANSLATIONS = {
     dragDropFile: 'Drag & drop image here or click to select',
     removeAttachment: 'Remove Attachment',
     viewAttachment: 'View Receipt',
+    searchPlaceholderCustomers: 'Search by customer name or phone...',
+    searchPlaceholderSuppliers: 'Search by supplier or medicine...',
   },
   ur: {
     appName: 'AsquafMedical',
@@ -172,5 +174,7 @@ export const TRANSLATIONS = {
     dragDropFile: 'تصویر یہاں ڈریگ کریں یا منتخب کرنے کے لیے کلک کریں',
     removeAttachment: 'فائل حذف کریں',
     viewAttachment: 'رسید دیکھیں',
+    searchPlaceholderCustomers: 'گاہک کا نام یا فون نمبر تلاش کریں...',
+    searchPlaceholderSuppliers: 'سپلائر کا نام، دوا، یا بل کی تفصیل تلاش کریں...',
   }
 };

@@ -27,7 +27,8 @@ import {
   ExternalLink,
   Paperclip,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Search
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { format, isToday, isPast, isBefore, addDays, parseISO, differenceInDays } from 'date-fns';
@@ -74,6 +75,7 @@ export default function App() {
   const [isAdding, setIsAdding] = useState(false);
   const [paymentRecord, setPaymentRecord] = useState<SupplierRecord | null>(null);
   const [notifiedRecords, setNotifiedRecords] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
   
   // Google Sheets integration state
   const [user, setUser] = useState<any>(null);
@@ -94,6 +96,11 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('pharmacy_records', JSON.stringify(records));
   }, [records]);
+
+  // Reset search when activeTab changes
+  useEffect(() => {
+    setSearchQuery('');
+  }, [activeTab]);
 
   // Google Auth lifecycle
   useEffect(() => {
@@ -465,7 +472,7 @@ export default function App() {
       groups[key].push(r);
     });
     
-    return Object.values(groups).map(groupRecords => {
+    const allGroups = Object.values(groups).map(groupRecords => {
       const sorted = [...groupRecords].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
       const totalAmount = sorted.reduce((sum, r) => sum + r.amount, 0);
       const earliestDue = [...groupRecords].sort((a, b) => new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime())[0]?.dueDate;
@@ -481,11 +488,18 @@ export default function App() {
         latestDate: primaryRecord.date
       };
     }).sort((a, b) => new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime());
-  }, [records, activeTab]);
+
+    if (!searchQuery) return allGroups;
+    const query = searchQuery.trim().toLowerCase();
+    return allGroups.filter(g => 
+      g.customerName.toLowerCase().includes(query) || 
+      g.phoneNumber.toLowerCase().includes(query)
+    );
+  }, [records, activeTab, searchQuery]);
 
   // View records filter
   const filteredRecords = useMemo(() => {
-    return records.filter(r => {
+    const suppliers = records.filter(r => {
       if (activeTab === 'suppliers') {
         const isSupplier = r.type === 'supplier';
         if (isSupplier) {
@@ -496,7 +510,18 @@ export default function App() {
       }
       return false;
     });
-  }, [records, activeTab]);
+
+    if (!searchQuery) return suppliers;
+    const query = searchQuery.trim().toLowerCase();
+    return suppliers.filter(r => {
+      const s = r as SupplierRecord;
+      const matchesSupplierName = s.supplierName.toLowerCase().includes(query);
+      const matchesPhone = s.phoneNumber ? s.phoneNumber.toLowerCase().includes(query) : false;
+      const matchesDesc = s.description ? s.description.toLowerCase().includes(query) : false;
+      const matchesItems = s.items ? s.items.some(item => item.name.toLowerCase().includes(query)) : false;
+      return matchesSupplierName || matchesPhone || matchesDesc || matchesItems;
+    });
+  }, [records, activeTab, searchQuery]);
 
   if (authLoading) {
     return (
@@ -659,6 +684,30 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 overflow-y-auto px-4 py-4 mb-20 space-y-5 scroll-smooth">
+        {activeTab !== 'settings' && (
+          <div className="relative w-full">
+            <div className={`absolute inset-y-0 ${isUrdu ? 'right-4' : 'left-4'} flex items-center pointer-events-none text-[#8696a0]`}>
+              <Search size={18} />
+            </div>
+            <input 
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder={activeTab === 'customers' ? t.searchPlaceholderCustomers : t.searchPlaceholderSuppliers}
+              className={`w-full bg-[#202c33] text-[#e9edef] placeholder-[#8696a0]/50 text-sm rounded-2xl ${isUrdu ? 'pr-12 pl-10' : 'pl-12 pr-10'} py-3 border border-white/5 outline-none focus:border-[#00a884] focus:ring-1 focus:ring-[#00a884] transition-all`}
+            />
+            {searchQuery && (
+              <button 
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className={`absolute inset-y-0 ${isUrdu ? 'left-3' : 'right-3'} flex items-center text-[#8696a0] hover:text-[#e9edef] transition-colors cursor-pointer`}
+              >
+                <X size={18} />
+              </button>
+            )}
+          </div>
+        )}
+
         {activeTab !== 'settings' && (
           <AnimatePresence mode="popLayout">
             {((activeTab === 'customers' && groupedCustomers.length === 0) || 
