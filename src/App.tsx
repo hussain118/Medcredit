@@ -392,8 +392,17 @@ export default function App() {
   // View records filter
   const filteredRecords = useMemo(() => {
     return records.filter(r => {
-      if (activeTab === 'customers') return r.type === 'customer';
-      if (activeTab === 'suppliers') return r.type === 'supplier';
+      if (activeTab === 'customers') {
+        return r.type === 'customer' && r.status !== 'paid';
+      }
+      if (activeTab === 'suppliers') {
+        const isSupplier = r.type === 'supplier';
+        if (isSupplier) {
+          const calcs = getSupplierDueCalculations(r as SupplierRecord, new Date());
+          return calcs.status !== 'settled';
+        }
+        return false;
+      }
       return false;
     });
   }, [records, activeTab]);
