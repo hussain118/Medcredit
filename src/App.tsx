@@ -28,7 +28,8 @@ import {
   Paperclip,
   ChevronDown,
   ChevronUp,
-  Search
+  Search,
+  Sparkles
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { format, isToday, isPast, isBefore, addDays, parseISO, differenceInDays } from 'date-fns';
@@ -52,10 +53,15 @@ import {
 import { createSpreadsheet, syncToSpreadsheet } from './googleSheets';
 import { handleSchemaMigration, migrateRecords } from './lib/migration';
 import { getSupplierDueCalculations } from './lib/supplierDues';
+import ExpiryProPanel from './components/ExpiryProPanel';
+import { RETURN_POLICIES } from './lib/returnPolicies';
+import { resolveManufacturer } from './lib/companyAliases';
+import { resolveBrandToManufacturer } from './lib/brandMap';
+import { computeExpiryState } from './lib/expiryEngine';
 
 export default function App() {
   // State
-  const [activeTab, setActiveTab] = useState<'customers' | 'suppliers' | 'settings'>('customers');
+  const [activeTab, setActiveTab] = useState<'customers' | 'suppliers' | 'settings' | 'expiry'>('customers');
   const [records, setRecords] = useState<AppRecord[]>(() => {
     const saved = localStorage.getItem('pharmacy_records');
     return handleSchemaMigration(saved);
@@ -261,6 +267,91 @@ export default function App() {
     const interval = setInterval(checkDueDates, 60000); // Check every minute
     return () => clearInterval(interval);
   }, [records, settings, notifiedRecords, isUrdu]);
+
+  // Daily Expiry Pro notification
+  useEffect(() => {
+    if (!("Notification" in window)) return;
+    
+    Notification.requestPermission();
+
+    const checkDailyExpiryNotification = () => {
+      const todayStr = new Date().toISOString().split('T')[0];
+      const lastSentDate = localStorage.getItem('last_expiry_notification_date');
+      
+      if (lastSentDate === todayStr) {
+        return; // Already sent today
+      }
+
+      // Check if Expiry Pro is unlocked
+      const isProUnlocked = localStorage.getItem('expiry_pro_unlocked') === 'true';
+      if (!isProUnlocked) return;
+
+      const savedInvoices = localStorage.getItem('scanned_invoices');
+      if (!savedInvoices) return;
+
+      try {
+        const invoices = JSON.parse(savedInvoices);
+        let itemsNeededIntimationThisWeek = 0;
+        let totalRecoverable = 0;
+
+        const savedBrandMap = localStorage.getItem('user_brand_map');
+        const userBrandMap = savedBrandMap ? JSON.parse(savedBrandMap) : {};
+        const savedPolicies = localStorage.getItem('user_policies');
+        const userPolicies = savedPolicies ? JSON.parse(savedPolicies) : {};
+        const allPolicies = { ...RETURN_POLICIES, ...userPolicies };
+
+        invoices.forEach((inv: any) => {
+          inv.lines.forEach((line: any) => {
+            let maker = line.manufacturer;
+            if (!maker) {
+              const resolved = resolveBrandToManufacturer(line.brand, userBrandMap);
+              maker = resolved !== undefined ? resolved : null;
+            }
+            if (maker) {
+              const resolvedMaker = resolveManufacturer(maker);
+              if (resolvedMaker) maker = resolvedMaker;
+            }
+
+            let policy = null;
+            if (maker) {
+              const canonicalMaker = resolveManufacturer(maker) || maker.toLowerCase().trim();
+              policy = allPolicies[canonicalMaker] || null;
+            }
+
+            const meta = computeExpiryState(line, policy, todayStr);
+
+            // Notice within 7 days
+            if (meta.state === 'INTIMATION_OPEN' && meta.daysToIntimation !== null && meta.daysToIntimation >= 0 && meta.daysToIntimation <= 7) {
+              itemsNeededIntimationThisWeek++;
+            }
+
+            if (meta.state !== 'DEAD') {
+              totalRecoverable += meta.totalLoss;
+            }
+          });
+        });
+
+        if (itemsNeededIntimationThisWeek > 0) {
+          const bodyText = isUrdu
+            ? `⚠️ ${itemsNeededIntimationThisWeek} ادویات کی اطلاع اس ہفتے درکار ہے۔ Rs. ${totalRecoverable.toLocaleString()} قابلِ واپسی رقم۔`
+            : `⚠️ ${itemsNeededIntimationThisWeek} items need intimation this week · Rs. ${totalRecoverable.toLocaleString()} recoverable. Tap to review.`;
+
+          new Notification(settings.pharmacyName, {
+            body: bodyText,
+            icon: '/favicon.ico'
+          });
+
+          localStorage.setItem('last_expiry_notification_date', todayStr);
+        }
+      } catch (err) {
+        console.error("Failed to parse invoices for daily notification:", err);
+      }
+    };
+
+    checkDailyExpiryNotification();
+    const interval = setInterval(checkDailyExpiryNotification, 1800000); // Check every 30 minutes
+    return () => clearInterval(interval);
+  }, [settings, isUrdu]);
 
   // Actions
   const addRecord = async (newRecord: Omit<AppRecord, 'id' | 'status'>) => {
@@ -684,7 +775,7 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 overflow-y-auto px-4 py-4 mb-20 space-y-5 scroll-smooth">
-        {activeTab !== 'settings' && (
+        {activeTab !== 'settings' && activeTab !== 'expiry' && (
           <div className="relative w-full">
             <div className={`absolute inset-y-0 ${isUrdu ? 'right-4' : 'left-4'} flex items-center pointer-events-none text-[#8696a0]`}>
               <Search size={18} />
@@ -708,7 +799,7 @@ export default function App() {
           </div>
         )}
 
-        {activeTab !== 'settings' && (
+        {activeTab !== 'settings' && activeTab !== 'expiry' && (
           <AnimatePresence mode="popLayout">
             {((activeTab === 'customers' && groupedCustomers.length === 0) || 
               (activeTab === 'suppliers' && filteredRecords.length === 0)) ? (
@@ -746,6 +837,10 @@ export default function App() {
               ))
             )}
           </AnimatePresence>
+        )}
+
+        {activeTab === 'expiry' && (
+          <ExpiryProPanel language={settings.language} pharmacyName={settings.pharmacyName} />
         )}
 
         {activeTab === 'settings' && (
@@ -806,13 +901,19 @@ export default function App() {
           label={t.suppliers}
         />
         <NavButton 
+          active={activeTab === 'expiry'} 
+          onClick={() => setActiveTab('expiry')} 
+          icon={<Sparkles size={22} />} 
+          label={t.expiryPro}
+        />
+        <NavButton 
           active={activeTab === 'settings'} 
           onClick={() => setActiveTab('settings')} 
           icon={<SettingsIcon size={22} />} 
           label={t.settings}
         />
 
-        {activeTab !== 'settings' && (
+        {activeTab !== 'settings' && activeTab !== 'expiry' && (
           <button 
             onClick={() => setIsAdding(true)}
             className="absolute -top-10 right-6 w-16 h-16 bg-[#00a884] text-white rounded-full flex items-center justify-center shadow-[0_8px_20px_rgba(0,168,132,0.4)] hover:scale-105 active:scale-95 transition-all duration-200 z-50 ring-4 ring-[#202c33]"
