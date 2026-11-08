@@ -1,0 +1,33 @@
+{
+  "name": "medcredit",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "turbo lint",
+    "format": "turbo format",
+    "typecheck": "turbo typecheck",
+    "check": "ultracite check",
+    "fix": "ultracite fix"
+  },
+  "devDependencies": {
+    "@shadcn/lint": "^0.2.3",
+    "@workspace/typescript-config": "workspace:*",
+    "oxfmt": "^0.77.0",
+    "oxlint": "^1.90.0",
+    "oxlint-plugin-react-doctor": "^0.9.21",
+    "oxlint-tsgolint": "^7.0.2005",
+    "turbo": "^2.11.10",
+    "typescript": "^5",
+    "ultracite": "8.1.1"
+  },
+  "packageManager": "bun@1.3.14",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}
